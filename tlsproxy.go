@@ -77,12 +77,13 @@ type bufferConn struct {
 
 func (c *bufferConn) Read(b []byte) (n int, err error) {
 	n, err = c.conn.Read(b)
-	c.buf = append(c.buf, b...)
+	c.buf = append(c.buf, b[0:n]...)
 	return
 }
 
 func (c *bufferConn) Write(b []byte) (n int, err error) {
-	return c.conn.Write(b)
+	// We don't support writing
+	return 0, fmt.Errorf("bufferConn is not writable")
 }
 
 func (c *bufferConn) Close() error {
