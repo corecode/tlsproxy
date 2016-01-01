@@ -6,21 +6,28 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http/httputil"
 	"strings"
 	"time"
 
 	"./contrib/tls"
 )
 
+var destHosts map[string]string
+
 func main() {
-	var tlsport = flag.String("tlsport", "https", "tls port to listen on")
+	var tlsPort = flag.String("tlsport", "https", "tls port to listen on")
+	var httpPort = flag.String("httpport", "", "http port to listen on")
 	flag.Parse()
 
-	if !strings.Contains(*tlsport, ":") {
-		*tlsport = fmt.Sprintf(":%s", *tlsport)
+	if *tlsPort != "" && !strings.Contains(*tlsPort, ":") {
+		*tlsPort = fmt.Sprintf(":%s", *tlsPort)
+	}
+	if *httpPort != "" && !strings.Contains(*httpPort, ":") {
+		*httpPort = fmt.Sprintf(":%s", *httpPort)
 	}
 
-	destHosts := make(map[string]string)
+	destHosts = make(map[string]string)
 	for _, serv := range flag.Args() {
 		toAddr := serv
 		if strings.Contains(serv, ":") {
@@ -30,22 +37,40 @@ func main() {
 		destHosts[serv] = toAddr
 	}
 
-	ln, err := net.Listen("tcp", *tlsport)
+	if *httpPort != "" {
+		httpListen, err := net.Listen("tcp", *httpPort)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		go func() {
+			for {
+				conn, err := httpListen.Accept()
+				if err != nil {
+					log.Print(err)
+					continue
+				}
+				go handleHttpConnection(conn)
+			}
+		}()
+	}
+
+	tlsListen, err := net.Listen("tcp", *tlsPort)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := tlsListen.Accept()
 		if err != nil {
 			log.Print(err)
 			continue
 		}
-		go handleTlsConnection(destHosts, conn)
+		go handleTlsConnection(conn)
 	}
 }
 
-func handleTlsConnection(destHosts map[string]string, inConn net.Conn) {
+func handleTlsConnection(inConn net.Conn) {
 	var err error
 	var serverName string
 
@@ -61,17 +86,40 @@ func handleTlsConnection(destHosts map[string]string, inConn net.Conn) {
 		}
 	}
 
-	destName, ok := destHosts[serverName]
+	proxyConn(bufConn, serverName, "https")
+}
+
+func handleHttpConnection(inConn net.Conn) {
+	var serverName string
+
+	defer inConn.Close()
+
+	bufConn := &bufferConn{conn: inConn}
+	{
+		httpConn := httputil.NewServerConn(bufConn, nil)
+		req, err := httpConn.Read()
+		if err != nil {
+			log.Print(err)
+			return
+		}
+		serverName = req.Host
+	}
+
+	proxyConn(bufConn, serverName, "http")
+}
+
+func proxyConn(bufConn *bufferConn, host string, port string) {
+	destName, ok := destHosts[host]
 	if !ok {
-		log.Printf("connection requested to `%s' does not match any destination host", serverName)
+		log.Printf("connection requested to `%s' does not match any destination host", host)
 		return
 	}
 
-	log.Printf("tls connection for %s, connecting to %s", serverName, destName)
+	log.Printf("connection for %s, connecting to %s", host, destName)
 
 	addr := destName
 	if !strings.Contains(addr, ":") {
-		addr = fmt.Sprintf("%s:443", destName)
+		addr = fmt.Sprintf("%s:%s", destName, port)
 	}
 	outConn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -90,20 +138,20 @@ func handleTlsConnection(destHosts map[string]string, inConn net.Conn) {
 	c := make(chan bool)
 	go func() {
 		defer func() { c <- true }()
-		count, err := io.Copy(outConn, inConn)
+		count, err := io.Copy(outConn, bufConn.conn)
 		if err != nil {
 			log.Print(err)
 		}
 		inCount += count
 	}()
-	count, err := io.Copy(inConn, outConn)
+	count, err := io.Copy(bufConn.conn, outConn)
 	if err != nil {
 		log.Print(err)
 	}
 	outCount += count
 
 	<-c
-	log.Printf("tls connection closed, in: %d, out: %d", inCount, outCount)
+	log.Printf("connection closed, in: %d, out: %d", inCount, outCount)
 }
 
 type bufferConn struct {
